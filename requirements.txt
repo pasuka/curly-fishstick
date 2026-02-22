@@ -1,0 +1,6 @@
+Panel>=1.3.0
+Bokeh>=3.3.0
+Pandas>=2.0.0
+Numpy>=1.24.0
+Akshare>=1.12.0
+Yfinance>=0.2.30
