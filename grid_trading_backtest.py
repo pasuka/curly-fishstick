@@ -6,6 +6,10 @@
 import panel as pn
 import pandas as pd
 import numpy as np
+import threading
+import os
+import re
+from pathlib import Path
 from itertools import product
 from datetime import datetime, timedelta
 from bokeh.plotting import figure
@@ -15,11 +19,135 @@ from bokeh.layouts import column as bk_column
 
 pn.extension('tabulator', sizing_mode='stretch_width')
 
+DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / 'data_cache'
+
+
+def _sanitize_filename_part(text: str) -> str:
+    value = (text or '').strip()
+    value = re.sub(r'[\\/:*?"<>|\s]+', '_', value)
+    value = value.strip('._')
+    return value or 'unknown'
+
+
+def _build_cache_file_path(
+    symbol: str,
+    name: str,
+    start_date: str,
+    end_date: str,
+    cache_dir: str | Path | None,
+) -> Path:
+    root_dir = Path(cache_dir).expanduser() if cache_dir else DEFAULT_CACHE_DIR
+    if not root_dir.is_absolute():
+        root_dir = Path(__file__).resolve().parent / root_dir
+    root_dir.mkdir(parents=True, exist_ok=True)
+
+    symbol_part = _sanitize_filename_part(symbol)
+    name_part = _sanitize_filename_part(name)
+    start_part = _sanitize_filename_part(start_date)
+    end_part = _sanitize_filename_part(end_date)
+    filename = f"{symbol_part}+{name_part}+{start_part}+{end_part}.csv"
+    return root_dir / filename
+
+
+def _normalize_data_columns(df: pd.DataFrame) -> pd.DataFrame:
+    needed = ['datetime', 'open', 'high', 'low', 'close', 'volume']
+    df = df[[c for c in needed if c in df.columns]].copy()
+    if 'datetime' not in df.columns or 'close' not in df.columns:
+        return pd.DataFrame()
+    if 'datetime' in df.columns:
+        df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+    for c in ['open', 'high', 'low', 'close', 'volume']:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    df = df.dropna(subset=['datetime', 'close']).sort_values('datetime').reset_index(drop=True)
+    return df
+
+
+def _load_cached_data(cache_file: Path) -> pd.DataFrame:
+    if not cache_file.exists():
+        return pd.DataFrame()
+    try:
+        cached_df = pd.read_csv(cache_file)
+        if cached_df.empty:
+            return pd.DataFrame()
+        return _normalize_data_columns(cached_df)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _save_cached_data(df: pd.DataFrame, cache_file: Path) -> None:
+    if df.empty:
+        return
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(cache_file, index=False, encoding='utf-8-sig')
+
+
+def resolve_symbol_name(symbol: str) -> str:
+    """根据代码自动解析股票/ETF名称，失败时返回代码本身。"""
+    symbol = (symbol or '').strip()
+    if not symbol:
+        return ''
+
+    try:
+        import akshare as ak
+
+        if symbol.isdigit():
+            # A股个股
+            try:
+                info_df = ak.stock_individual_info_em(symbol=symbol)
+                if not info_df.empty:
+                    key_col = 'item' if 'item' in info_df.columns else '项目'
+                    val_col = 'value' if 'value' in info_df.columns else '值'
+                    if key_col in info_df.columns and val_col in info_df.columns:
+                        matches = info_df[info_df[key_col].astype(str).str.contains('股票简称|证券简称', regex=True)]
+                        if not matches.empty:
+                            name = str(matches.iloc[0][val_col]).strip()
+                            if name:
+                                return name
+            except Exception:
+                pass
+
+            # ETF
+            try:
+                etf_df = ak.fund_etf_spot_em()
+                if not etf_df.empty and '代码' in etf_df.columns and '名称' in etf_df.columns:
+                    match = etf_df[etf_df['代码'].astype(str) == symbol]
+                    if not match.empty:
+                        name = str(match.iloc[0]['名称']).strip()
+                        if name:
+                            return name
+            except Exception:
+                pass
+    except ImportError:
+        pass
+
+    # 回退：美股/港股等
+    try:
+        import yfinance as yf
+
+        ticker = yf.Ticker(symbol)
+        info = ticker.info or {}
+        name = str(info.get('shortName') or info.get('longName') or '').strip()
+        if name:
+            return name
+    except Exception:
+        pass
+
+    return symbol
+
 # ========================
 # 数据获取模块
 # ========================
 
-def fetch_stock_data(symbol: str, start_date: str, end_date: str, interval: str = '5m') -> pd.DataFrame:
+def fetch_stock_data(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    interval: str = '5m',
+    name: str = '',
+    cache_dir: str | Path | None = None,
+    force_refresh: bool = False,
+) -> pd.DataFrame:
     """
     使用 akshare 获取A股/ETF的分钟级别数据。
     如果 akshare 不可用，则回退到 yfinance（适用于美股/港股等）。
@@ -33,6 +161,12 @@ def fetch_stock_data(symbol: str, start_date: str, end_date: str, interval: str 
         DataFrame: 包含 datetime, open, high, low, close, volume 列
     """
     df = pd.DataFrame()
+    cache_file = _build_cache_file_path(symbol, name or symbol, start_date, end_date, cache_dir)
+    if not force_refresh:
+        cached_df = _load_cached_data(cache_file)
+        if not cached_df.empty:
+            return cached_df
+
     start_dt = datetime.strptime(start_date, '%Y-%m-%d')
     end_dt = datetime.strptime(end_date, '%Y-%m-%d')
     requested_days = (end_dt - start_dt).days
@@ -80,13 +214,8 @@ def fetch_stock_data(symbol: str, start_date: str, end_date: str, interval: str 
                 '最高': 'high', '最低': 'low', '成交量': 'volume',
             }
             df = df.rename(columns=col_map)
-            needed = ['datetime', 'open', 'high', 'low', 'close', 'volume']
-            df = df[[c for c in needed if c in df.columns]]
-            df['datetime'] = pd.to_datetime(df['datetime'])
-            for c in ['open', 'high', 'low', 'close', 'volume']:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors='coerce')
-            df = df.dropna(subset=['close']).reset_index(drop=True)
+            df = _normalize_data_columns(df)
+            _save_cached_data(df, cache_file)
             return df
 
     except ImportError:
@@ -110,15 +239,10 @@ def fetch_stock_data(symbol: str, start_date: str, end_date: str, interval: str 
                 'Close': 'close', 'Volume': 'volume',
             }
             df = df.rename(columns=rename_map)
-            needed = ['datetime', 'open', 'high', 'low', 'close', 'volume']
-            df = df[[c for c in needed if c in df.columns]]
-            df['datetime'] = pd.to_datetime(df['datetime'])
+            df = _normalize_data_columns(df)
             if df['datetime'].dt.tz is not None:
                 df['datetime'] = df['datetime'].dt.tz_localize(None)
-            for c in ['open', 'high', 'low', 'close', 'volume']:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors='coerce')
-            df = df.dropna(subset=['close']).reset_index(drop=True)
+            _save_cached_data(df, cache_file)
             return df
 
     except ImportError:
@@ -550,6 +674,24 @@ def build_app():
         placeholder='例: 510300, 159915, AAPL',
         width=260,
     )
+    stock_name_input = pn.widgets.TextInput(
+        name='🏷️ 股票名称（用于缓存命名）',
+        value='沪深300ETF',
+        placeholder='将根据股票代码自动更新',
+        width=260,
+        disabled=True,
+    )
+    cache_dir_input = pn.widgets.TextInput(
+        name='🗂️ 数据缓存目录',
+        value='data_cache',
+        placeholder='例: data_cache 或 D:/market_cache',
+        width=260,
+    )
+    force_refresh_cache_input = pn.widgets.Checkbox(
+        name='♻️ 强制刷新缓存（忽略本地）',
+        value=False,
+        width=260,
+    )
     start_date_input = pn.widgets.DatePicker(
         name='📅 开始日期',
         value=(datetime.now() - timedelta(days=180)).date(),
@@ -635,6 +777,12 @@ def build_app():
         value=5, step=1, start=1, end=20,
         width=260,
     )
+    exit_button = pn.widgets.Button(
+        name='🚪 退出程序',
+        button_type='danger',
+        width=260,
+        height=40,
+    )
     apply_best_button = pn.widgets.Button(
         name='✅ 应用最佳参数并回测',
         button_type='success',
@@ -654,6 +802,9 @@ def build_app():
         pn.pane.Markdown("# 🔧 参数设置", styles={'color': '#2c3e50'}),
         pn.layout.Divider(),
         symbol_input,
+        stock_name_input,
+        cache_dir_input,
+        force_refresh_cache_input,
         start_date_input,
         end_date_input,
         pn.layout.Divider(),
@@ -676,6 +827,7 @@ def build_app():
         optimize_topn_input,
         optimize_button,
         apply_best_button,
+        exit_button,
         optimize_status_text,
         status_text,
         width=300,
@@ -692,6 +844,9 @@ def build_app():
     )
     trades_table_pane = pn.Column()
     optimization_state = {'best': None, 'results': None}
+
+    def _sync_stock_name(symbol_value: str):
+        stock_name_input.value = resolve_symbol_name(symbol_value)
 
     def _build_engine_with_params(data, sell_pct, buy_pct, grid_lot):
         p_upper = price_upper_input.value if price_upper_input.value > 0 else None
@@ -711,14 +866,31 @@ def build_app():
             price_lower=p_lower,
         )
 
+    def on_symbol_change(event):
+        _sync_stock_name(event.new)
+
+    symbol_input.param.watch(on_symbol_change, 'value')
+    _sync_stock_name(symbol_input.value)
+
     def optimize_params(event):
         optimize_status_text.object = '⏳ 正在执行参数优化，请稍候...'
         optimize_status_text.alert_type = 'warning'
         try:
             symbol = symbol_input.value.strip()
+            stock_name = stock_name_input.value.strip()
+            cache_dir = cache_dir_input.value.strip() or None
+            force_refresh_cache = force_refresh_cache_input.value
             start_str = start_date_input.value.strftime('%Y-%m-%d')
             end_str = end_date_input.value.strftime('%Y-%m-%d')
-            data = fetch_stock_data(symbol, start_str, end_str, interval='5m')
+            data = fetch_stock_data(
+                symbol,
+                start_str,
+                end_str,
+                interval='5m',
+                name=stock_name,
+                cache_dir=cache_dir,
+                force_refresh=force_refresh_cache,
+            )
             if data.empty:
                 optimize_status_text.object = '❌ 优化失败：未获取到数据'
                 optimize_status_text.alert_type = 'danger'
@@ -824,6 +996,36 @@ def build_app():
         optimize_status_text.alert_type = 'success'
         run_backtest(None)
 
+    exit_confirm_state = {'pending': False, 'timer': None}
+
+    def _reset_exit_confirm():
+        exit_confirm_state['pending'] = False
+        exit_confirm_state['timer'] = None
+        exit_button.name = '🚪 退出程序'
+
+    def exit_app(event):
+        if not exit_confirm_state['pending']:
+            exit_confirm_state['pending'] = True
+            exit_button.name = '⚠️ 再点一次确认退出'
+            status_text.object = '⚠️ 请再次点击「退出程序」以确认，5秒后自动取消'
+            status_text.alert_type = 'warning'
+
+            timer = exit_confirm_state.get('timer')
+            if timer is not None:
+                timer.cancel()
+            timer = threading.Timer(5.0, _reset_exit_confirm)
+            exit_confirm_state['timer'] = timer
+            timer.start()
+            return
+
+        status_text.object = '👋 正在退出程序...'
+        status_text.alert_type = 'warning'
+
+        def _terminate():
+            os._exit(0)
+
+        threading.Timer(0.3, _terminate).start()
+
     # ---------- 回测逻辑 ----------
     def run_backtest(event):
         status_text.object = '⏳ 正在获取数据...'
@@ -831,11 +1033,22 @@ def build_app():
 
         try:
             symbol = symbol_input.value.strip()
+            stock_name = stock_name_input.value.strip()
+            cache_dir = cache_dir_input.value.strip() or None
+            force_refresh_cache = force_refresh_cache_input.value
             start_str = start_date_input.value.strftime('%Y-%m-%d')
             end_str = end_date_input.value.strftime('%Y-%m-%d')
 
             # 获取数据
-            data = fetch_stock_data(symbol, start_str, end_str, interval='5m')
+            data = fetch_stock_data(
+                symbol,
+                start_str,
+                end_str,
+                interval='5m',
+                name=stock_name,
+                cache_dir=cache_dir,
+                force_refresh=force_refresh_cache,
+            )
             if data.empty:
                 status_text.object = '❌ 未获取到数据，请检查代码和日期'
                 status_text.alert_type = 'danger'
@@ -966,6 +1179,7 @@ def build_app():
     run_button.on_click(run_backtest)
     optimize_button.on_click(optimize_params)
     apply_best_button.on_click(apply_best_params)
+    exit_button.on_click(exit_app)
 
     # ---------- 主布局 ----------
     main_content = pn.Column(
